@@ -93,5 +93,230 @@ internal class Program
         {
             throw new ArgumentException($"Meteorology data source {dataSource} not recognized.");
         }
+        
+        // Set up the meteorology and domain
+        MetManager meteorology = new MetManager(configOptions.InputOutput.MetDirectory, lonLims, latLims, startDate, 
+            configOptions.InputOutput.SerialMetData, subwatches, dataSource);
+        (double[] lonEdge, double[] latEdge) = meteorology.GetXYMesh();
+        DomainManager domainManager = new DomainManager(lonEdge, latEdge, pLims, AP, BP,
+            meteorology, subwatches, boxHeightsNeeded, fixedPressures);
+
+        // Time handling
+        double nDays = (endDate - startDate).TotalDays; // Days to run
+        double duration = 60.0 * 60.0 * 24.0 * nDays; // Simulation duration in seconds
+        // Use epoch time
+        DateTime refDate = new DateTime(1970, 1, 1, 0, 0, 0, 0);
+        double tStart = (startDate - refDate).TotalSeconds;
+        double tStop = tStart + duration;
+        double tCurr = tStart;
+        int iterMax = (int)Math.Ceiling((tStop - tStart)/dt);
+        double tReport = tStart; // Next time we want output to go to the user
+        double tStorage = tStart + dtStorage; // Next time that we want data to be added to the in-memory archive
+        double tOutput = tStart + dtOutput; // Next time we want the in-memory archive to be written to file
+            
+        List<PointManager> pointManagers = [];
+
+        // Use a master RNG to generate seeds predictably
+        Random masterRandomNumberGenerator;
+        if (configOptions.Seed != null)
+        {
+            // Use this if debugging
+            masterRandomNumberGenerator = new SystemRandomSource((int)configOptions.Seed);
+        }
+        else
+        {
+            masterRandomNumberGenerator = SystemRandomSource.Default;
+        }
+        List<int> seedsUsed = [];
+            
+        // Dense point managers need an RNG for random point seeding
+        // This approach is designed to avoid two failure modes:
+        // * The relationship between successive managers being consistent (avoided by using a master RNG)
+        // * Seeds being reused (avoided by generating until you hit a new seed)
+        // The generation-until-new-seed is in theory slow but that would only matter if we were generating
+        // a large number (>>>10) of dense point managers, which is not expected to be the case
+        if (configOptions.PointsDense.Active)
+        {
+            Random pointMgrRandomNumberGenerator = GetNextRandomNumberGenerator(masterRandomNumberGenerator, seedsUsed);
+
+            // The point manager holds all the actual point data and controls velocity calculations (in deg/s)
+            PointManager pointManager = new PointManagerDense(domainManager, configOptions, configOptions.PointsDense, pointMgrRandomNumberGenerator);
+
+            // Scatter N points randomly over the domain
+            (double[] xInitial, double[] yInitial, double[] pInitial) =
+                domainManager.MapRandomToXYP(configOptions.PointsDense.Initial, pointMgrRandomNumberGenerator);
+            pointManager.CreatePointSet(xInitial, yInitial, pInitial);
+
+            // Add to the list of _all_ point managers
+            pointManagers.Add(pointManager);
+        }
+
+        // Now add plume point managers - contrail point managers, exhaust point managers...
+        // Current proposed approach will be to do this via logical connections (i.e. one manager handles
+        // all contrails) rather than e.g. one manager per flight
+        // The point manager holds all the actual point data and controls velocity calculations (in deg/s)
+        if (configOptions.PointsFlights.Active)
+        {
+            Random pointMgrRandomNumberGenerator = GetNextRandomNumberGenerator(masterRandomNumberGenerator, seedsUsed);
+            PointManagerFlight pointManager = new PointManagerFlight(domainManager, configOptions, configOptions.PointsFlights, pointMgrRandomNumberGenerator);
+
+            if (configOptions.PointsFlights.ScheduleFilename != null)
+            {
+                Debug.Assert(configOptions.PointsFlights.AirportsFilename != null,
+                    "No airport file provided");
+                string scheduleFileName = Path.Join(configOptions.InputOutput.InputDirectory,
+                    configOptions.PointsFlights.ScheduleFilename);
+                string airportFileName = Path.Join(configOptions.InputOutput.InputDirectory,
+                    configOptions.PointsFlights.AirportsFilename);
+                pointManager.ReadScheduleFile(scheduleFileName, airportFileName, startDate, endDate);
+            }
+                
+            if (configOptions.PointsFlights.SegmentsFilename != null)
+            {
+                pointManager.ReadSegmentsFile(configOptions.PointsFlights.SegmentsFilename);
+            }
+                
+            // Add to the list of _all_ point managers
+            pointManagers.Add(pointManager);
+        }
+        
+        if (pointManagers.Count == 0)
+        {
+            throw new ArgumentException("No point managers enabled.");
+        }
+
+        // How many time points have been stored?
+        int nStored = 0;
+
+        // Don't report at initialization
+        tReport += dtReport;
+        
+        int nSteps = 0;
+        int nReports = 0;
+        double pointSum = 0;
+        bool accuratePointAverage = false;
+        
+        Console.WriteLine("Beginning simulation main loop.");
+        for (int iter=0;iter<iterMax; iter++)
+        {
+            // Update meteorological data
+            if (updateMeteorology)
+            {
+                meteorology.AdvanceToTime(currentDate);
+                // Calculate derived quantities
+                domainManager.UpdateMeteorology();
+            }
+            
+            foreach (PointManager pointManager in pointManagers)
+            {
+                // Seed new points
+                subwatches["Point seeding"].Start();
+                pointManager.Seed(dt);
+                subwatches["Point seeding"].Stop();
+                    
+                // Do the actual work
+                subwatches["Point physics"].Start();
+                pointManager.Advance(dt);
+                subwatches["Point physics"].Stop();
+
+                // TODO: Allow for this to not happen every time step
+                subwatches["Point culling"].Start();
+                pointManager.Cull();
+                subwatches["Point culling"].Stop();
+            }
+
+            nSteps++;
+            tCurr = tStart + (iter+1) * dt;
+            currentDate = currentDate.AddSeconds(dt);
+            
+            // Update the user on simulation progress
+            if (tCurr >= (tReport - 1.0e-10))
+            {
+                long totalActive = pointManagers.Sum(pm => pm.NActive);
+                Console.WriteLine($" --> Time at end of time step: {currentDate}. Point count across all managers: {totalActive,10:d}");
+                tReport += dtReport;
+                pointSum += totalActive;
+                nReports++;
+            }
+            else if (accuratePointAverage)
+            {
+                long totalActive = pointManagers.Sum(pm => pm.NActive);
+                pointSum += totalActive;
+            }
+
+            // For diagnostics - must take place AFTER tCurr advances
+            // Only store data every dtStorage seconds. Use a small offset
+            // to compensate for imperfect float comparisons
+            if (tCurr >= (tStorage - 1.0e-10))
+            {
+                subwatches["Archiving"].Start();
+                foreach (PointManager pointManager in pointManagers)
+                {
+                    pointManager.ArchiveConditions(tCurr);
+                }
+                subwatches["Archiving"].Stop();
+                tStorage += dtStorage;
+                nStored += 1;
+            }
+            
+            if (tCurr >= tOutput - 1.0e-10)
+            {
+                subwatches["File writing"].Start();
+                foreach (PointManager pointManager in pointManagers)
+                {
+                    long maxPoints = pointManager.MaxStoredPoints;
+                    string fileName = pointManager.WriteToFile(currentDate,reset: true);
+                }
+                tOutput += dtOutput;
+                nStored = 0;
+                subwatches["File writing"].Stop();
+            }
+        }
+        
+        // At simulation end, deactivate all points to force writes if trajectories are in use
+        foreach (PointManager pm in pointManagers)
+        {
+            pm.DeactivateAllPoints();
+        }
+        
+        watch.Stop();
+        long elapsedTimeLong = watch.ElapsedMilliseconds;
+        double elapsedTime = (double)elapsedTimeLong;
+        double msPerStep = elapsedTime/nSteps;
+        Console.WriteLine($"{nSteps} steps completed in {elapsedTime/1000.0,6:f1} seconds ({msPerStep,6:f2} ms per step)");
+        int nPointSums = accuratePointAverage ? nSteps : nReports;
+        if (nPointSums >= 1)
+        {
+            Console.WriteLine($"Simulation average point count (at reporting times): {pointSum / nPointSums}");
+        }
+        else
+        {
+            Console.WriteLine("No point average calculated (simulation too short).");
+        }
+
+        foreach (string watchName in subwatches.Keys)
+        {
+            string watchOutput;
+            if (subwatches[watchName].IsRunning)
+            {
+                watchOutput = "error (watch still running)";
+            }
+            else
+            {
+                double subwatchTime = (double)subwatches[watchName].ElapsedMilliseconds;
+                watchOutput =
+                    $"{subwatchTime / 1000.0,12:f2} seconds ({100.0 * subwatchTime / elapsedTime,10:f2}% of total)";
+            }
+            Console.WriteLine($" --> {watchName,20:s}: {watchOutput}");
+        }
+    }
+    
+    private static Random GetNextRandomNumberGenerator(Random masterRandomNumberGenerator, ICollection<int> seedsUsed)
+    {
+        int seed;
+        do { seed = masterRandomNumberGenerator.Next(); } while (seedsUsed.Contains(seed));
+        Random subRandomNumberGenerator = new SystemRandomSource(seed);
+        seedsUsed.Add(seed);
+        return subRandomNumberGenerator;
     }
 }
