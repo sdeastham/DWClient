@@ -1,0 +1,5 @@
+*.nc
+*.nc4
+obj/
+bin/
+.idea/
