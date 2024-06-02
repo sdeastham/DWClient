@@ -16,6 +16,8 @@ points-dense:
   initial: 1500
   # Calculate delta T due to pressure change?
   adiabatic-compression: true
+  # Use first-order integration only?
+  first-order-integration: false
   kg-per-point: 2.0e13
   output-filename: dense-points-{date}.nc
   output-variables: [ "temperature",
@@ -29,6 +31,7 @@ points-flights:
   use-icao: true
   max: null
   adiabatic-compression: true
+  first-order-integration: false
   output-filename: flight-waypoints-{date}.nc
   output-variables: ["segment_length",
                      "segment_stretch",

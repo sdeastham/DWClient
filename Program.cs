@@ -96,7 +96,7 @@ internal class Program
         
         // Set up the meteorology and domain
         MetManager meteorology = new MetManager(configOptions.InputOutput.MetDirectory, lonLims, latLims, startDate, 
-            configOptions.InputOutput.SerialMetData, subwatches, dataSource);
+            subwatches, dataSource);
         (double[] lonEdge, double[] latEdge) = meteorology.GetXYMesh();
         DomainManager domainManager = new DomainManager(lonEdge, latEdge, pLims, AP, BP,
             meteorology, subwatches, boxHeightsNeeded, fixedPressures);
